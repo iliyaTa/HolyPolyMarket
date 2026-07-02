@@ -33,6 +33,8 @@ def fetch_trades():
     resp.raise_for_status()
     data = resp.json()
 
+    print("RAW API RESPONSE:", json.dumps(data, ensure_ascii=False)[:3000])
+
     # پاسخ ممکنه مستقیم لیست باشه یا داخل یه کلید مثل "results" بیاد
     if isinstance(data, list):
         return data
