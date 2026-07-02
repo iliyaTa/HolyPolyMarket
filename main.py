@@ -35,13 +35,15 @@ def fetch_trades():
 
     print("RAW API RESPONSE:", json.dumps(data, ensure_ascii=False)[:3000])
 
-    # پاسخ ممکنه مستقیم لیست باشه یا داخل یه کلید مثل "results" بیاد
+    # نتایج داخل data.results هستن
+    if isinstance(data, dict):
+        inner = data.get("data")
+        if isinstance(inner, dict) and isinstance(inner.get("results"), list):
+            return inner["results"]
+        if isinstance(data.get("results"), list):
+            return data["results"]
     if isinstance(data, list):
         return data
-    if isinstance(data, dict):
-        for key in ("results", "data", "trades"):
-            if key in data and isinstance(data[key], list):
-                return data[key]
     return []
 
 
@@ -68,28 +70,23 @@ def send_telegram(text):
 
 
 def trade_id(trade):
-    # سعی می‌کنیم یه شناسه یکتا برای هر معامله بسازیم، حتی اگه API فیلد id نده
-    for key in ("id", "trade_id", "tx_hash", "transaction_hash"):
-        if trade.get(key):
-            return str(trade[key])
+    if trade.get("id"):
+        return str(trade["id"])
+    if trade.get("transaction_hash"):
+        return str(trade["transaction_hash"])
     return "|".join(
         str(trade.get(k, ""))
-        for k in ("market", "outcome", "side", "value", "price", "trade_time", "timestamp")
+        for k in ("slug", "outcome", "side", "size", "price", "timestamp")
     )
 
 
 def format_trade(trade):
-    side = (trade.get("side") or trade.get("action") or "").upper()
-    market = (
-        trade.get("market")
-        or trade.get("market_title")
-        or trade.get("title")
-        or "بازار نامشخص"
-    )
-    outcome = trade.get("outcome") or trade.get("outcome_name") or ""
-    value = trade.get("value") or trade.get("amount") or trade.get("size")
+    side = (trade.get("side") or "").upper()
+    market = trade.get("slug") or "بازار نامشخص"
+    outcome = trade.get("outcome") or ""
+    size = trade.get("size")
     price = trade.get("price")
-    trade_time = trade.get("trade_time") or trade.get("timestamp") or ""
+    timestamp = trade.get("timestamp") or ""
 
     if side == "BUY":
         verb = "🟢 باز کرد (خرید)"
@@ -102,12 +99,12 @@ def format_trade(trade):
     lines.append(f"بازار: {market}")
     if outcome:
         lines.append(f"سمت: {outcome}")
-    if value is not None:
-        lines.append(f"مبلغ: ${value}")
+    if size is not None:
+        lines.append(f"مبلغ: ${size:,.2f}" if isinstance(size, (int, float)) else f"مبلغ: ${size}")
     if price is not None:
-        lines.append(f"قیمت: ${price}")
-    if trade_time:
-        lines.append(f"زمان: {trade_time}")
+        lines.append(f"قیمت: ${price:.4f}" if isinstance(price, (int, float)) else f"قیمت: ${price}")
+    if timestamp:
+        lines.append(f"زمان: {timestamp}")
     return "\n".join(lines)
 
 
