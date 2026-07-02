@@ -10,14 +10,21 @@ WALLET = "0x688051ca7cd43270d8f26b48ecdc9beb2d23cf03"
 
 STATE_FILE = "state.json"
 
-API_URL = "https://narrative.agent.heisenberg.so/v2/traders/stats"
+API_URL = "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized"
+
+# agent_id 581 = Wallet 360 (60+ wallet performance, behavior, and risk metrics)
+TRADER_STATS_AGENT_ID = 581
 
 
 def fetch_stats():
     payload = {
-        "wallet": WALLET,
-        "metrics": ["pnl", "roi", "win_rate", "drawdown"],
-        "timeframe": "90d",
+        "agent_id": TRADER_STATS_AGENT_ID,
+        "params": {
+            "proxy_wallet": WALLET,
+            "window_days": "3",
+        },
+        "pagination": {"limit": 100, "offset": 0},
+        "formatter_config": {"format_type": "raw"},
     }
     headers = {
         "Authorization": f"Bearer {HEISENBERG_TOKEN}",
@@ -47,34 +54,28 @@ def send_telegram(text):
 
 def format_message(new, old, is_first_run):
     wallet_short = WALLET[:6] + "..." + WALLET[-4:]
+
+    # اگه پاسخ داخل یه لیست (نتایج جستجو) اومده باشه، اولین آیتم رو برمی‌داریم
+    if isinstance(new, dict) and "results" in new and isinstance(new["results"], list):
+        new = new["results"][0] if new["results"] else {}
+    if isinstance(old, dict) and "results" in old and isinstance(old["results"], list):
+        old = old["results"][0] if old["results"] else {}
+
     if is_first_run:
-        return (
-            f"🟢 مانیتورینگ شروع شد\n"
-            f"Wallet: {wallet_short}\n\n"
-            f"PnL: {new.get('total_pnl')}\n"
-            f"ROI: {new.get('roi')}\n"
-            f"Win rate: {new.get('win_rate')}\n"
-            f"Max drawdown: {new.get('max_drawdown')}\n"
-            f"Trades: {new.get('total_trades')}\n"
-            f"Active positions: {new.get('active_positions')}"
-        )
+        lines = [f"🟢 مانیتورینگ شروع شد\nWallet: {wallet_short}\n"]
+        for key, value in new.items():
+            lines.append(f"{key}: {value}")
+        return "\n".join(lines)
 
     lines = [f"🔔 تغییر در آمار Wallet {wallet_short}"]
-    fields = [
-        ("total_pnl", "PnL"),
-        ("roi", "ROI"),
-        ("win_rate", "Win rate"),
-        ("max_drawdown", "Max drawdown"),
-        ("total_trades", "Trades"),
-        ("active_positions", "Active positions"),
-    ]
     changed = False
-    for key, label in fields:
+    all_keys = set(new.keys()) | set(old.keys())
+    for key in sorted(all_keys):
         old_v = old.get(key)
         new_v = new.get(key)
         if old_v != new_v:
             changed = True
-            lines.append(f"{label}: {old_v} → {new_v}")
+            lines.append(f"{key}: {old_v} → {new_v}")
     if not changed:
         return None
     return "\n".join(lines)
