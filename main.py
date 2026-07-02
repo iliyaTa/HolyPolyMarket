@@ -9,19 +9,21 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 WALLET = "0x688051ca7cd43270d8f26b48ecdc9beb2d23cf03"
 
 STATE_FILE = "state.json"
+HISTORY_LIMIT = 10  # چند تا معامله آخر رو با /history نشون بده
 
 API_URL = "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized"
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # agent_id 556 = Polymarket Trades (تاریخچه معاملات بر اساس wallet)
 TRADES_AGENT_ID = 556
 
 
+# ---------------- Heisenberg API ----------------
+
 def fetch_trades():
     payload = {
         "agent_id": TRADES_AGENT_ID,
-        "params": {
-            "proxy_wallet": WALLET,
-        },
+        "params": {"proxy_wallet": WALLET},
         "pagination": {"limit": 25, "offset": 0},
         "formatter_config": {"format_type": "raw"},
     }
@@ -33,9 +35,6 @@ def fetch_trades():
     resp.raise_for_status()
     data = resp.json()
 
-    print("RAW API RESPONSE:", json.dumps(data, ensure_ascii=False)[:3000])
-
-    # نتایج داخل data.results هستن
     if isinstance(data, dict):
         inner = data.get("data")
         if isinstance(inner, dict) and isinstance(inner.get("results"), list):
@@ -45,28 +44,6 @@ def fetch_trades():
     if isinstance(data, list):
         return data
     return []
-
-
-def load_seen_ids():
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return set(data)
-        except Exception:
-            pass
-    return set()
-
-
-def save_seen_ids(ids):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(ids), f, ensure_ascii=False, indent=2)
-
-
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
 
 def trade_id(trade):
@@ -95,8 +72,7 @@ def format_trade(trade):
     else:
         verb = f"معامله ({side or '?'})"
 
-    lines = [verb]
-    lines.append(f"بازار: {market}")
+    lines = [verb, f"بازار: {market}"]
     if outcome:
         lines.append(f"سمت: {outcome}")
     if size is not None:
@@ -108,30 +84,117 @@ def format_trade(trade):
     return "\n".join(lines)
 
 
+# ---------------- Telegram ----------------
+
+def send_telegram(text):
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+
+
+def get_telegram_updates(offset):
+    params = {"timeout": 0}
+    if offset is not None:
+        params["offset"] = offset
+    resp = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json().get("result", [])
+
+
+def handle_commands(last_update_id, trades_history):
+    """چک می‌کنه ببینه کاربر دستوری مثل /history فرستاده یا نه، جواب میده."""
+    updates = get_telegram_updates(offset=(last_update_id + 1) if last_update_id else None)
+    new_last_id = last_update_id
+    for update in updates:
+        new_last_id = update["update_id"]
+        message = update.get("message") or update.get("channel_post")
+        if not message:
+            continue
+        text = (message.get("text") or "").strip().lower()
+        chat_id = message.get("chat", {}).get("id")
+
+        if text.startswith("/start"):
+            if not trades_history:
+                reply = "👋 سلام! هنوز هیچ معامله‌ای ثبت نشده."
+            else:
+                recent = trades_history[:3]
+                blocks = [format_trade(t) for t in recent]
+                reply = "👋 سلام! ۳ پوزیشن آخر:\n\n" + "\n\n".join(blocks)
+            requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": reply})
+
+        elif text.startswith("/history"):
+            if not trades_history:
+                reply = "هنوز هیچ معامله‌ای ذخیره نشده."
+            else:
+                recent = trades_history[:HISTORY_LIMIT]
+                blocks = [format_trade(t) for t in recent]
+                reply = f"📜 آخرین {len(recent)} معامله:\n\n" + "\n\n".join(blocks)
+            requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": reply})
+    return new_last_id
+
+
+# ---------------- State ----------------
+
+def load_state():
+    default = {"seen_ids": [], "trades": [], "last_update_id": None}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                default.update(data)
+            elif isinstance(data, list):
+                # فرمت خیلی قدیمی: فقط لیست id ها بود
+                default["seen_ids"] = data
+        except Exception:
+            pass
+    return default
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ---------------- Main ----------------
+
 def main():
-    trades = fetch_trades()
-    seen_ids = load_seen_ids()
+    state = load_state()
+    seen_ids = set(state.get("seen_ids") or [])
+    trades_history = state.get("trades") or []
     is_first_run = len(seen_ids) == 0
 
+    trades = fetch_trades()
     new_trades = [t for t in trades if trade_id(t) not in seen_ids]
 
     if is_first_run:
-        # اولین اجرا: فقط وضعیت رو ذخیره می‌کنیم، برای همه معاملات قدیمی نوتیف نمی‌فرستیم
         send_telegram(
             f"🟢 مانیتورینگ شروع شد\nWallet: {WALLET[:6]}...{WALLET[-4:]}\n"
             f"{len(trades)} معامله اخیر پیدا شد و به‌عنوان تاریخچه ذخیره شد.\n"
-            f"از این به بعد فقط معاملات جدید بهت اطلاع داده میشه."
+            f"از این به بعد فقط معاملات جدید بهت اطلاع داده میشه.\n"
+            f"برای دیدن تاریخچه هر وقت خواستی، بنویس /history"
         )
     elif new_trades:
-        # جدیدترین معامله معمولاً اول لیسته؛ به ترتیب زمانی (قدیم به جدید) می‌فرستیم
         for trade in reversed(new_trades):
             send_telegram(format_trade(trade))
         print(f"Sent {len(new_trades)} new trade notifications.")
     else:
         print("No new trades.")
 
-    all_ids = seen_ids | {trade_id(t) for t in trades}
-    save_seen_ids(all_ids)
+    # آپدیت تاریخچه: جدیدترین‌ها اول لیست
+    seen_ids |= {trade_id(t) for t in trades}
+    existing_ids_in_history = {trade_id(t) for t in trades_history}
+    for t in trades:
+        if trade_id(t) not in existing_ids_in_history:
+            trades_history.insert(0, t)
+    trades_history = trades_history[:100]  # فقط ۱۰۰ تای آخر رو نگه دار
+
+    # چک کردن دستور /history
+    new_last_update_id = handle_commands(state.get("last_update_id"), trades_history)
+
+    save_state({
+        "seen_ids": list(seen_ids),
+        "trades": trades_history,
+        "last_update_id": new_last_update_id,
+    })
 
 
 if __name__ == "__main__":
