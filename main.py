@@ -12,18 +12,17 @@ STATE_FILE = "state.json"
 
 API_URL = "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized"
 
-# agent_id 581 = Wallet 360 (60+ wallet performance, behavior, and risk metrics)
-TRADER_STATS_AGENT_ID = 581
+# agent_id 556 = Polymarket Trades (تاریخچه معاملات بر اساس wallet)
+TRADES_AGENT_ID = 556
 
 
-def fetch_stats():
+def fetch_trades():
     payload = {
-        "agent_id": TRADER_STATS_AGENT_ID,
+        "agent_id": TRADES_AGENT_ID,
         "params": {
             "proxy_wallet": WALLET,
-            "window_days": "3",
         },
-        "pagination": {"limit": 100, "offset": 0},
+        "pagination": {"limit": 25, "offset": 0},
         "formatter_config": {"format_type": "raw"},
     }
     headers = {
@@ -32,19 +31,28 @@ def fetch_stats():
     }
     resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+
+    # پاسخ ممکنه مستقیم لیست باشه یا داخل یه کلید مثل "results" بیاد
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("results", "data", "trades"):
+            if key in data and isinstance(data[key], list):
+                return data[key]
+    return []
 
 
-def load_previous_state():
+def load_seen_ids():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+            return set(json.load(f))
+    return set()
 
 
-def save_state(state):
+def save_seen_ids(ids):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        json.dump(list(ids), f, ensure_ascii=False, indent=2)
 
 
 def send_telegram(text):
@@ -52,47 +60,74 @@ def send_telegram(text):
     requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
 
 
-def format_message(new, old, is_first_run):
-    wallet_short = WALLET[:6] + "..." + WALLET[-4:]
+def trade_id(trade):
+    # سعی می‌کنیم یه شناسه یکتا برای هر معامله بسازیم، حتی اگه API فیلد id نده
+    for key in ("id", "trade_id", "tx_hash", "transaction_hash"):
+        if trade.get(key):
+            return str(trade[key])
+    return "|".join(
+        str(trade.get(k, ""))
+        for k in ("market", "outcome", "side", "value", "price", "trade_time", "timestamp")
+    )
 
-    # اگه پاسخ داخل یه لیست (نتایج جستجو) اومده باشه، اولین آیتم رو برمی‌داریم
-    if isinstance(new, dict) and "results" in new and isinstance(new["results"], list):
-        new = new["results"][0] if new["results"] else {}
-    if isinstance(old, dict) and "results" in old and isinstance(old["results"], list):
-        old = old["results"][0] if old["results"] else {}
 
-    if is_first_run:
-        lines = [f"🟢 مانیتورینگ شروع شد\nWallet: {wallet_short}\n"]
-        for key, value in new.items():
-            lines.append(f"{key}: {value}")
-        return "\n".join(lines)
+def format_trade(trade):
+    side = (trade.get("side") or trade.get("action") or "").upper()
+    market = (
+        trade.get("market")
+        or trade.get("market_title")
+        or trade.get("title")
+        or "بازار نامشخص"
+    )
+    outcome = trade.get("outcome") or trade.get("outcome_name") or ""
+    value = trade.get("value") or trade.get("amount") or trade.get("size")
+    price = trade.get("price")
+    trade_time = trade.get("trade_time") or trade.get("timestamp") or ""
 
-    lines = [f"🔔 تغییر در آمار Wallet {wallet_short}"]
-    changed = False
-    all_keys = set(new.keys()) | set(old.keys())
-    for key in sorted(all_keys):
-        old_v = old.get(key)
-        new_v = new.get(key)
-        if old_v != new_v:
-            changed = True
-            lines.append(f"{key}: {old_v} → {new_v}")
-    if not changed:
-        return None
+    if side == "BUY":
+        verb = "🟢 باز کرد (خرید)"
+    elif side == "SELL":
+        verb = "🔴 بست (فروخت)"
+    else:
+        verb = f"معامله ({side or '?'})"
+
+    lines = [verb]
+    lines.append(f"بازار: {market}")
+    if outcome:
+        lines.append(f"سمت: {outcome}")
+    if value is not None:
+        lines.append(f"مبلغ: ${value}")
+    if price is not None:
+        lines.append(f"قیمت: ${price}")
+    if trade_time:
+        lines.append(f"زمان: {trade_time}")
     return "\n".join(lines)
 
 
 def main():
-    new_state = fetch_stats()
-    old_state = load_previous_state()
+    trades = fetch_trades()
+    seen_ids = load_seen_ids()
+    is_first_run = len(seen_ids) == 0
 
-    message = format_message(new_state, old_state, is_first_run=(old_state is None))
-    if message:
-        send_telegram(message)
-        print("Notification sent:\n", message)
+    new_trades = [t for t in trades if trade_id(t) not in seen_ids]
+
+    if is_first_run:
+        # اولین اجرا: فقط وضعیت رو ذخیره می‌کنیم، برای همه معاملات قدیمی نوتیف نمی‌فرستیم
+        send_telegram(
+            f"🟢 مانیتورینگ شروع شد\nWallet: {WALLET[:6]}...{WALLET[-4:]}\n"
+            f"{len(trades)} معامله اخیر پیدا شد و به‌عنوان تاریخچه ذخیره شد.\n"
+            f"از این به بعد فقط معاملات جدید بهت اطلاع داده میشه."
+        )
+    elif new_trades:
+        # جدیدترین معامله معمولاً اول لیسته؛ به ترتیب زمانی (قدیم به جدید) می‌فرستیم
+        for trade in reversed(new_trades):
+            send_telegram(format_trade(trade))
+        print(f"Sent {len(new_trades)} new trade notifications.")
     else:
-        print("No change detected, no notification sent.")
+        print("No new trades.")
 
-    save_state(new_state)
+    all_ids = seen_ids | {trade_id(t) for t in trades}
+    save_seen_ids(all_ids)
 
 
 if __name__ == "__main__":
