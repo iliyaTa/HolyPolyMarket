@@ -57,37 +57,68 @@ def trade_id(trade):
     )
 
 
+def format_timestamp(ts):
+    """تبدیل 2026-07-02T20:29:59Z به یه فرمت خواناتر"""
+    try:
+        from datetime import datetime
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        return dt.strftime("%d %b, %H:%M UTC")
+    except Exception:
+        return ts
+
+
 def format_trade(trade):
     side = (trade.get("side") or "").upper()
-    market = trade.get("slug") or "بازار نامشخص"
+    slug = trade.get("slug") or ""
     outcome = trade.get("outcome") or ""
     size = trade.get("size")
     price = trade.get("price")
     timestamp = trade.get("timestamp") or ""
 
     if side == "BUY":
-        verb = "🟢 باز کرد (خرید)"
+        emoji, action = "🟢", "باز کرد"
     elif side == "SELL":
-        verb = "🔴 بست (فروخت)"
+        emoji, action = "🔴", "بست"
     else:
-        verb = f"معامله ({side or '?'})"
+        emoji, action = "⚪️", side or "نامشخص"
 
-    lines = [verb, f"بازار: {market}"]
+    market_display = slug.replace("-", " ").title() if slug else "بازار نامشخص"
+    market_link = f"https://polymarket.com/event/{slug}" if slug else None
+
+    lines = [f"{emoji} <b>{action}</b>"]
+
+    if market_link:
+        lines.append(f'📊 <a href="{market_link}">{market_display}</a>')
+    else:
+        lines.append(f"📊 {market_display}")
+
     if outcome:
-        lines.append(f"سمت: {outcome}")
-    if size is not None:
-        lines.append(f"مبلغ: ${size:,.2f}" if isinstance(size, (int, float)) else f"مبلغ: ${size}")
-    if price is not None:
-        lines.append(f"قیمت: ${price:.4f}" if isinstance(price, (int, float)) else f"قیمت: ${price}")
+        lines.append(f"↳ سمت: <b>{outcome}</b>")
+
+    if isinstance(size, (int, float)) and isinstance(price, (int, float)):
+        total = size * price
+        lines.append(f"💰 {size:,.0f} × ${price:.3f} = <b>${total:,.0f}</b>")
+    elif size is not None:
+        lines.append(f"💰 مبلغ: {size}")
+
     if timestamp:
-        lines.append(f"زمان: {timestamp}")
+        lines.append(f"🕒 {format_timestamp(timestamp)}")
+
+    trader_link = f"https://polymarketanalytics.com/traders/{WALLET}#trades"
+    lines.append(f'🔗 <a href="{trader_link}">مشاهده پروفایل تریدر</a>')
+
     return "\n".join(lines)
 
 
 # ---------------- Telegram ----------------
 
 def send_telegram(text):
-    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    })
 
 
 def get_telegram_updates(offset):
@@ -111,14 +142,19 @@ def handle_commands(last_update_id, trades_history):
         text = (message.get("text") or "").strip().lower()
         chat_id = message.get("chat", {}).get("id")
 
+        SEPARATOR = "\n➖➖➖➖➖\n"
+
         if text.startswith("/start"):
             if not trades_history:
-                reply = "👋 سلام! هنوز هیچ معامله‌ای ثبت نشده."
+                reply = "هنوز هیچ معامله‌ای ثبت نشده."
             else:
                 recent = trades_history[:3]
                 blocks = [format_trade(t) for t in recent]
-                reply = "👋 سلام! ۳ پوزیشن آخر:\n\n" + "\n\n".join(blocks)
-            requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": reply})
+                reply = "📈 <b>۳ پوزیشن آخر</b>" + SEPARATOR + SEPARATOR.join(blocks)
+            requests.post(f"{TELEGRAM_API}/sendMessage", json={
+                "chat_id": chat_id, "text": reply,
+                "parse_mode": "HTML", "disable_web_page_preview": True,
+            })
 
         elif text.startswith("/history"):
             if not trades_history:
@@ -126,8 +162,11 @@ def handle_commands(last_update_id, trades_history):
             else:
                 recent = trades_history[:HISTORY_LIMIT]
                 blocks = [format_trade(t) for t in recent]
-                reply = f"📜 آخرین {len(recent)} معامله:\n\n" + "\n\n".join(blocks)
-            requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": reply})
+                reply = f"📜 <b>آخرین {len(recent)} معامله</b>" + SEPARATOR + SEPARATOR.join(blocks)
+            requests.post(f"{TELEGRAM_API}/sendMessage", json={
+                "chat_id": chat_id, "text": reply,
+                "parse_mode": "HTML", "disable_web_page_preview": True,
+            })
     return new_last_id
 
 
@@ -166,11 +205,13 @@ def main():
     new_trades = [t for t in trades if trade_id(t) not in seen_ids]
 
     if is_first_run:
+        trader_link = f"https://polymarketanalytics.com/traders/{WALLET}#trades"
         send_telegram(
-            f"🟢 مانیتورینگ شروع شد\nWallet: {WALLET[:6]}...{WALLET[-4:]}\n"
-            f"{len(trades)} معامله اخیر پیدا شد و به‌عنوان تاریخچه ذخیره شد.\n"
+            f"🟢 <b>مانیتورینگ شروع شد</b>\n"
+            f'👤 <a href="{trader_link}">{WALLET[:6]}...{WALLET[-4:]}</a>\n'
+            f"{len(trades)} معامله اخیر پیدا شد و ذخیره شد.\n\n"
             f"از این به بعد فقط معاملات جدید بهت اطلاع داده میشه.\n"
-            f"برای دیدن تاریخچه هر وقت خواستی، بنویس /history"
+            f"دستورها: /history (۱۰ معامله آخر) — /start (۳ پوزیشن آخر)"
         )
     elif new_trades:
         for trade in reversed(new_trades):
@@ -180,12 +221,12 @@ def main():
         print("No new trades.")
 
     # آپدیت تاریخچه: جدیدترین‌ها اول لیست
-    seen_ids |= {trade_id(t) for t in trades}
+    # trades از API همیشه با ترتیب «جدید به قدیم» میاد، پس باید همون ترتیب حفظ بشه
     existing_ids_in_history = {trade_id(t) for t in trades_history}
-    for t in trades:
-        if trade_id(t) not in existing_ids_in_history:
-            trades_history.insert(0, t)
+    new_items = [t for t in trades if trade_id(t) not in existing_ids_in_history]
+    trades_history = new_items + trades_history  # جدیدها میرن جلوی لیست، بدون بهم‌ریختن ترتیب
     trades_history = trades_history[:100]  # فقط ۱۰۰ تای آخر رو نگه دار
+    seen_ids |= {trade_id(t) for t in trades}
 
     # چک کردن دستور /history
     new_last_update_id = handle_commands(state.get("last_update_id"), trades_history)
