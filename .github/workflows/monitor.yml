@@ -1,8 +1,8 @@
 name: Wallet Monitor
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  repository_dispatch:
+    types: [check-wallet]
   workflow_dispatch: {}
 
 permissions:
