@@ -48,12 +48,24 @@ def fetch_positions():
     """پوزیشن‌های الان بازِ این wallet، با قیمت/احتمال زنده"""
     resp = requests.get(
         f"{DATA_API}/positions",
-        params={"user": WALLET, "sizeThreshold": 1, "limit": 100},
+        params={"user": WALLET, "sizeThreshold": 1, "limit": 200},
         timeout=30,
     )
     resp.raise_for_status()
     data = resp.json()
-    return data if isinstance(data, list) else []
+    positions = data if isinstance(data, list) else []
+
+    # بازارهایی که نتیجه‌شون مشخص شده (curPrice دقیقاً 0 یا 1) یا قابل-نقد-کردن‌ان
+    # یعنی دیگه واقعاً «باز» نیستن، فقط منتظر Redeem موندن - حذفشون می‌کنیم
+    def is_actually_open(pos):
+        if pos.get("redeemable") is True:
+            return False
+        cur_price = pos.get("curPrice")
+        if isinstance(cur_price, (int, float)) and (cur_price <= 0.001 or cur_price >= 0.999):
+            return False
+        return True
+
+    return [p for p in positions if is_actually_open(p)]
 
 
 def trade_id(trade):
