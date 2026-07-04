@@ -1,66 +1,64 @@
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 
 # ---- تنظیمات از Secrets گیت‌هاب خونده میشه ----
-HEISENBERG_TOKEN = os.environ["HEISENBERG_TOKEN"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 WALLET = "0x688051ca7cd43270d8f26b48ecdc9beb2d23cf03"
 
 STATE_FILE = "state.json"
 HISTORY_LIMIT = 10
-BIG_TRADE_MULTIPLIER = 3  # اگه اندازه معامله بیشتر از ۳ برابر میانگین بود، هشدار بده
+BIG_TRADE_MULTIPLIER = 3
 
-API_URL = "https://narrative.agent.heisenberg.so/api/v2/semantic/retrieve/parameterized"
+# ---- API رسمی Polymarket (رایگان، بدون نیاز به توکن) ----
+DATA_API = "https://data-api.polymarket.com"
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-TRADES_AGENT_ID = 556
-
 TRADER_LINK = f"https://polymarketanalytics.com/traders/{WALLET}#trades"
 
 MAIN_KEYBOARD = {
-    "inline_keyboard": [[
-        {"text": "🆕 آخرین معامله‌ها", "callback_data": "recent3"},
-        {"text": "📜 ۱۰ معامله اخیر", "callback_data": "history"},
-    ]]
+    "inline_keyboard": [
+        [
+            {"text": "🆕 آخرین معامله‌ها", "callback_data": "recent3"},
+            {"text": "📜 ۱۰ معامله اخیر", "callback_data": "history"},
+        ],
+        [
+            {"text": "📍 پوزیشن‌های باز الان", "callback_data": "positions"},
+        ],
+    ]
 }
 
 
-# ---------------- Heisenberg API ----------------
+# ---------------- Polymarket Data API ----------------
 
-def fetch_trades():
-    payload = {
-        "agent_id": TRADES_AGENT_ID,
-        "params": {"proxy_wallet": WALLET},
-        "pagination": {"limit": 25, "offset": 0},
-        "formatter_config": {"format_type": "raw"},
-    }
-    headers = {
-        "Authorization": f"Bearer {HEISENBERG_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    resp = requests.post(API_URL, headers=headers, json=payload, timeout=30)
+def fetch_activity(limit=25):
+    """تاریخچه معاملات (Buy/Sell) این wallet، جدید به قدیم"""
+    resp = requests.get(
+        f"{DATA_API}/activity",
+        params={"user": WALLET, "limit": limit, "type": "TRADE"},
+        timeout=30,
+    )
     resp.raise_for_status()
     data = resp.json()
+    return data if isinstance(data, list) else []
 
-    if isinstance(data, dict):
-        inner = data.get("data")
-        if isinstance(inner, dict) and isinstance(inner.get("results"), list):
-            return inner["results"]
-        if isinstance(data.get("results"), list):
-            return data["results"]
-    if isinstance(data, list):
-        return data
-    return []
+
+def fetch_positions():
+    """پوزیشن‌های الان بازِ این wallet، با قیمت/احتمال زنده"""
+    resp = requests.get(
+        f"{DATA_API}/positions",
+        params={"user": WALLET, "sizeThreshold": 1, "limit": 100},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else []
 
 
 def trade_id(trade):
-    if trade.get("id"):
-        return str(trade["id"])
-    if trade.get("transaction_hash"):
-        return str(trade["transaction_hash"])
+    if trade.get("transactionHash"):
+        return f"{trade['transactionHash']}_{trade.get('asset', '')}"
     return "|".join(
         str(trade.get(k, ""))
         for k in ("slug", "outcome", "side", "size", "price", "timestamp")
@@ -68,66 +66,33 @@ def trade_id(trade):
 
 
 def format_timestamp(ts):
+    """timestamp از API به‌صورت epoch seconds میاد"""
     try:
-        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+        dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
         return dt.strftime("%d %b, %H:%M UTC")
     except Exception:
-        return ts
+        return str(ts)
 
 
-# ---------------- Positions / PnL ----------------
+# ---------------- Formatting: Trades ----------------
 
-def update_positions_and_get_pnl(positions, trade):
-    token_id = trade.get("token_id") or trade.get("slug", "") + trade.get("outcome", "")
-    side = (trade.get("side") or "").upper()
+def format_trade(trade, is_big=False):
     size = trade.get("size")
     price = trade.get("price")
-
-    if not isinstance(size, (int, float)) or not isinstance(price, (int, float)):
-        return None, None
-
-    pos = positions.get(token_id, {"size": 0.0, "cost": 0.0})
-
-    if side == "BUY":
-        pos["size"] += size
-        pos["cost"] += size * price
-        positions[token_id] = pos
-        return None, None
-
-    elif side == "SELL":
-        avg_cost = (pos["cost"] / pos["size"]) if pos["size"] > 0 else None
-        realized_pnl = None
-        if avg_cost is not None:
-            realized_pnl = size * (price - avg_cost)
-            pos["size"] -= size
-            pos["cost"] -= size * avg_cost
-            if pos["size"] < 0.0001:
-                pos["size"] = 0.0
-                pos["cost"] = 0.0
-        positions[token_id] = pos
-        return realized_pnl, avg_cost
-
-    return None, None
-
-
-# ---------------- Formatting ----------------
-
-def format_trade(trade, realized_pnl=None, is_big=False):
-    side = (trade.get("side") or "").upper()
-    slug = trade.get("slug") or ""
+    usdc_size = trade.get("usdcSize")
+    title = trade.get("title") or "بازار نامشخص"
     outcome = trade.get("outcome") or ""
-    size = trade.get("size")
-    price = trade.get("price")
-    timestamp = trade.get("timestamp") or ""
+    slug = trade.get("slug") or trade.get("eventSlug") or ""
+    timestamp = trade.get("timestamp")
 
+    side = (trade.get("side") or "").upper()
     if side == "BUY":
         emoji, action = "🟢", "باز کرد"
     elif side == "SELL":
         emoji, action = "🔴", "بست"
     else:
-        emoji, action = "⚪️", side or "نامشخص"
+        emoji, action = "⚪️", "معامله"
 
-    market_display = slug.replace("-", " ").title() if slug else "بازار نامشخص"
     market_link = f"https://polymarket.com/event/{slug}" if slug else None
 
     header = f"{emoji} <b>{action}</b>"
@@ -136,23 +101,18 @@ def format_trade(trade, realized_pnl=None, is_big=False):
     lines = [header]
 
     if market_link:
-        lines.append(f'📊 <a href="{market_link}">{market_display}</a>')
+        lines.append(f'📊 <a href="{market_link}">{title}</a>')
     else:
-        lines.append(f"📊 {market_display}")
+        lines.append(f"📊 {title}")
 
     if outcome:
-        lines.append(f"↳ سمت: <b>{outcome}</b>")
+        odds_txt = f" (احتمال: {price*100:.1f}%)" if isinstance(price, (int, float)) else ""
+        lines.append(f"↳ سمت: <b>{outcome}</b>{odds_txt}")
 
-    if isinstance(size, (int, float)) and isinstance(price, (int, float)):
-        total = size * price
-        lines.append(f"💰 {size:,.0f} × ${price:.3f} = <b>${total:,.0f}</b>")
-    elif size is not None:
-        lines.append(f"💰 مبلغ: {size}")
-
-    if realized_pnl is not None:
-        pnl_emoji = "📈" if realized_pnl >= 0 else "📉"
-        sign = "+" if realized_pnl >= 0 else ""
-        lines.append(f"{pnl_emoji} سود/زیان این پوزیشن: <b>{sign}${realized_pnl:,.0f}</b>")
+    if isinstance(usdc_size, (int, float)):
+        lines.append(f"💰 مبلغ: <b>${usdc_size:,.0f}</b>")
+    elif isinstance(size, (int, float)) and isinstance(price, (int, float)):
+        lines.append(f"💰 مبلغ: <b>${size * price:,.0f}</b>")
 
     if timestamp:
         lines.append(f"🕒 {format_timestamp(timestamp)}")
@@ -162,14 +122,63 @@ def format_trade(trade, realized_pnl=None, is_big=False):
     return "\n".join(lines)
 
 
-def average_trade_size(trades_history, exclude_id=None):
-    sizes = [
-        t.get("size") for t in trades_history
-        if isinstance(t.get("size"), (int, float)) and trade_id(t) != exclude_id
+def average_usdc_size(trades_history, exclude_id=None):
+    values = [
+        t.get("usdcSize") for t in trades_history
+        if isinstance(t.get("usdcSize"), (int, float)) and trade_id(t) != exclude_id
     ]
-    if not sizes:
+    if not values:
         return None
-    return sum(sizes) / len(sizes)
+    return sum(values) / len(values)
+
+
+# ---------------- Formatting: Positions (زنده) ----------------
+
+def format_position(pos):
+    title = pos.get("title") or "بازار نامشخص"
+    outcome = pos.get("outcome") or ""
+    slug = pos.get("slug") or pos.get("eventSlug") or ""
+    cur_price = pos.get("curPrice")
+    avg_price = pos.get("avgPrice")
+    initial_value = pos.get("initialValue")
+    current_value = pos.get("currentValue")
+    cash_pnl = pos.get("cashPnl")
+    percent_pnl = pos.get("percentPnl")
+
+    market_link = f"https://polymarket.com/event/{slug}" if slug else None
+    market_display = f'<a href="{market_link}">{title}</a>' if market_link else title
+
+    lines = [f"📊 {market_display}"]
+    if outcome:
+        lines.append(f"↳ سمت: <b>{outcome}</b>")
+
+    if isinstance(cur_price, (int, float)):
+        odds_line = f"🎯 احتمال الان: <b>{cur_price*100:.1f}%</b>"
+        if isinstance(avg_price, (int, float)):
+            odds_line += f"  (خرید با {avg_price*100:.1f}%)"
+        lines.append(odds_line)
+
+    if isinstance(initial_value, (int, float)) and isinstance(current_value, (int, float)):
+        lines.append(f"💵 سرمایه: ${initial_value:,.0f} ← ارزش الان: ${current_value:,.0f}")
+
+    if isinstance(cash_pnl, (int, float)):
+        emoji = "📈" if cash_pnl >= 0 else "📉"
+        sign = "+" if cash_pnl >= 0 else ""
+        pct_txt = f" ({sign}{percent_pnl:.1f}%)" if isinstance(percent_pnl, (int, float)) else ""
+        lines.append(f"{emoji} سود/زیان: <b>{sign}${cash_pnl:,.0f}</b>{pct_txt}")
+
+    return "\n".join(lines)
+
+
+def build_positions_reply():
+    positions = fetch_positions()
+    if not positions:
+        return "الان هیچ پوزیشن بازی نداره."
+    positions = sorted(positions, key=lambda p: p.get("currentValue") or 0, reverse=True)
+    blocks = [format_position(p) for p in positions]
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    header = f"📍 <b>پوزیشن‌های باز الان</b> (بروزرسانی: {now})"
+    return header + SEPARATOR + SEPARATOR.join(blocks)
 
 
 # ---------------- Telegram ----------------
@@ -244,6 +253,8 @@ def handle_commands(last_update_id, trades_history):
                 send_telegram_to(chat_id, build_recent3_reply(trades_history), MAIN_KEYBOARD)
             elif data == "history":
                 send_telegram_to(chat_id, build_history_reply(trades_history), MAIN_KEYBOARD)
+            elif data == "positions":
+                send_telegram_to(chat_id, build_positions_reply(), MAIN_KEYBOARD)
             answer_callback(callback.get("id"))
             continue
 
@@ -257,6 +268,8 @@ def handle_commands(last_update_id, trades_history):
             send_telegram_to(chat_id, build_recent3_reply(trades_history), MAIN_KEYBOARD)
         elif text.startswith("/history"):
             send_telegram_to(chat_id, build_history_reply(trades_history), MAIN_KEYBOARD)
+        elif text.startswith("/positions"):
+            send_telegram_to(chat_id, build_positions_reply(), MAIN_KEYBOARD)
 
     return new_last_id
 
@@ -264,19 +277,17 @@ def handle_commands(last_update_id, trades_history):
 # ---------------- State ----------------
 
 def load_state():
-    default = {"seen_ids": [], "trades": [], "last_update_id": None, "positions": {}}
+    default = {"seen_ids": [], "trades": [], "last_update_id": None}
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                default.update(data)
+                default.update({k: v for k, v in data.items() if k in default})
             elif isinstance(data, list):
                 default["seen_ids"] = data
         except Exception:
             pass
-    if not isinstance(default.get("positions"), dict):
-        default["positions"] = {}
     return default
 
 
@@ -291,16 +302,13 @@ def main():
     state = load_state()
     seen_ids = set(state.get("seen_ids") or [])
     trades_history = state.get("trades") or []
-    positions = state.get("positions") or {}
     is_first_run = len(seen_ids) == 0
 
-    trades = fetch_trades()
+    trades = fetch_activity(limit=25)
     new_trades = [t for t in trades if trade_id(t) not in seen_ids]
     new_trades_chronological = list(reversed(new_trades))
 
     if is_first_run:
-        for t in reversed(trades):
-            update_positions_and_get_pnl(positions, t)
         send_telegram(
             f"🟢 <b>مانیتورینگ شروع شد</b>\n"
             f'👤 <a href="{TRADER_LINK}">{WALLET[:6]}...{WALLET[-4:]}</a>\n'
@@ -310,20 +318,19 @@ def main():
         )
     elif new_trades_chronological:
         for trade in new_trades_chronological:
-            avg_size_before = average_trade_size(trades_history, exclude_id=trade_id(trade))
+            avg_before = average_usdc_size(trades_history, exclude_id=trade_id(trade))
             is_big = (
-                avg_size_before is not None
-                and isinstance(trade.get("size"), (int, float))
-                and trade["size"] > avg_size_before * BIG_TRADE_MULTIPLIER
+                avg_before is not None
+                and isinstance(trade.get("usdcSize"), (int, float))
+                and trade["usdcSize"] > avg_before * BIG_TRADE_MULTIPLIER
             )
-            realized_pnl, _ = update_positions_and_get_pnl(positions, trade)
-            send_telegram(format_trade(trade, realized_pnl=realized_pnl, is_big=is_big))
+            send_telegram(format_trade(trade, is_big=is_big))
         print(f"Sent {len(new_trades_chronological)} new trade notifications.")
     else:
         print("No new trades.")
 
-    existing_ids_in_history = {trade_id(t) for t in trades_history}
-    new_items = [t for t in trades if trade_id(t) not in existing_ids_in_history]
+    existing_ids = {trade_id(t) for t in trades_history}
+    new_items = [t for t in trades if trade_id(t) not in existing_ids]
     trades_history = new_items + trades_history
     trades_history = trades_history[:100]
     seen_ids |= {trade_id(t) for t in trades}
@@ -334,7 +341,6 @@ def main():
         "seen_ids": list(seen_ids),
         "trades": trades_history,
         "last_update_id": new_last_update_id,
-        "positions": positions,
     })
 
 
